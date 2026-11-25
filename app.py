@@ -18,7 +18,7 @@ from gi.repository import AyatanaAppIndicator3 as Indicator, Gio, GLib, Gtk, Sec
 from sync import Sync, WebDAV, last_transfer
 from watcher import DirectoryWatcher, LocalChanges
 
-VERSION = '0.0.2'
+VERSION = '0.0.3'
 APP_ID = 'ch.caesarlinx.CaesarSync'
 DATA = Path(GLib.get_user_data_dir()) / 'caesarsync'
 CONFIG = DATA / 'settings.json'
@@ -95,6 +95,7 @@ class MyCloud(Gtk.Application):
         self.refresh_menu()
         self.load_last_transfer()
         self.configure_watcher()
+        self.tick()
         GLib.timeout_add_seconds(2, self.tick)
         GLib.timeout_add(350, self.check_local_changes)
 
@@ -114,7 +115,8 @@ class MyCloud(Gtk.Application):
         return GLib.SOURCE_CONTINUE
 
     def do_activate(self):
-        self.show_settings()
+        # The tray owns the UI. Desktop launches leave it in the background.
+        pass
 
     def action(self, menu, label, handler):
         item = Gtk.MenuItem(label=label)
