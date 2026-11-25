@@ -17,6 +17,14 @@ CaesarSync watches selected local folders for saves and can upload them while a 
 
 ## Install
 
+### Ubuntu software installer
+
+Download the `.deb` package when it is listed under **Assets** on the release page. Open it with Ubuntu App Center and click **Install**. Ubuntu may ask you to authenticate to install system software. The package manager installs any missing libraries from the configured Ubuntu repositories.
+
+If your desktop has no graphical installer for local packages, run `sudo apt install ./caesarsync_1.0_all.deb` from your downloads folder.
+
+### Per-user archive
+
 Download and extract the bundle from [GitHub Releases](https://github.com/mimmolimmo/caesarsync/releases). The app requires Python 3.11+, GTK 3, a desktop with AppIndicator support, a Secret Service keyring, and `lsof`. On recent Ubuntu or Debian systems:
 
 ```sh
@@ -46,6 +54,8 @@ Reports from other Linux distributions and improvements to packaging and sync te
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
+
+To build the Ubuntu package from this checkout, run `./packaging/build-deb.sh`.
 
 Tests use a local mock WebDAV server and temporary directories. Please report security issues privately via the repository's **Security** tab.
 
