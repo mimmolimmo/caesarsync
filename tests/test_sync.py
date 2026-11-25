@@ -204,6 +204,43 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(set(listed), {'Selected'})
         self.assertEqual(self.cloud[relative], b'local save')
 
+    def test_remote_batch_applies_edit_rename_and_delete_after_reopen(self):
+        self.cloud['Selected/old.txt'] = b'rename me'
+        self.cloud['Selected/deleted.txt'] = b'delete me'
+        self.scan()
+        self.cloud['Selected/Café notes.txt'] = b'remote edit'
+        self.cloud['Selected/new.txt'] = self.cloud.pop('Selected/old.txt')
+        del self.cloud['Selected/deleted.txt']
+        listed = []
+        list_directory = self.dav.list
+
+        def track(folder=''):
+            listed.append(folder)
+            return list_directory(folder)
+
+        self.dav.list = track
+        sync = Sync(self.dav, self.root, self.db, 'test', lambda _: None, lambda: False)
+        self.assertEqual(sync.run(['Selected'], full=False, remote_paths=[
+            'Selected/Café notes.txt', 'Selected/old.txt', 'Selected/new.txt',
+            'Selected/deleted.txt', 'Other/skip.txt',
+        ]), ([], []))
+        self.assertEqual(listed, ['Selected'])
+        self.assertEqual(self.path.read_bytes(), b'remote edit')
+        self.assertEqual((self.path.parent / 'new.txt').read_bytes(), b'rename me')
+        self.assertFalse((self.path.parent / 'old.txt').exists())
+        self.assertFalse((self.path.parent / 'deleted.txt').exists())
+
+    def test_remote_batch_reconciles_a_renamed_directory(self):
+        self.cloud.update({'Selected/old': None, 'Selected/old/file.txt': b'text'})
+        self.scan()
+        self.cloud['Selected/new'] = self.cloud.pop('Selected/old')
+        self.cloud['Selected/new/file.txt'] = self.cloud.pop('Selected/old/file.txt')
+        sync = Sync(self.dav, self.root, self.db, 'test', lambda _: None, lambda: False)
+        self.assertEqual(sync.run(['Selected'], full=False,
+                                  remote_paths=['Selected/old/file.txt', 'Selected/new']), ([], []))
+        self.assertEqual((self.path.parent / 'new/file.txt').read_bytes(), b'text')
+        self.assertFalse((self.path.parent / 'old').exists())
+
     def test_upload_tracks_listing_tag_when_put_returns_a_different_tag(self):
         self.scan()
         relative = 'Selected/Café notes.txt'

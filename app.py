@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Selective Swisscom myCloud sync for the Ubuntu desktop."""
+from contextlib import closing
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ import sys
 from pathlib import Path
 import threading
 import time
+from urllib.error import HTTPError
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -16,15 +18,19 @@ gi.require_version('Secret', '1')
 from gi.repository import AyatanaAppIndicator3 as Indicator, Gio, GLib, Gtk, Secret
 
 from sync import Sync, WebDAV, last_transfer
+from feed import VERSION, read_events
 from watcher import DirectoryWatcher, LocalChanges
 
-VERSION = '0.0.3'
 APP_ID = 'ch.caesarlinx.CaesarSync'
 DATA = Path(GLib.get_user_data_dir()) / 'caesarsync'
 CONFIG = DATA / 'settings.json'
 DATABASE = DATA / 'sync.sqlite3'
 ICONS = Path(__file__).resolve().parent / 'icons'
 SCHEMA = Secret.Schema.new(APP_ID, Secret.SchemaFlags.NONE, {
+    'address': Secret.SchemaAttributeType.STRING,
+    'username': Secret.SchemaAttributeType.STRING,
+})
+FEED_SCHEMA = Secret.Schema.new(APP_ID + '.Feed', Secret.SchemaFlags.NONE, {
     'address': Secret.SchemaAttributeType.STRING,
     'username': Secret.SchemaAttributeType.STRING,
 })
@@ -47,6 +53,18 @@ def save(settings):
     temporary.replace(CONFIG)
 
 
+def checkpoint(settings, value=None):
+    key = sync_scope(settings) + json.dumps(sorted(settings['folders']))
+    with closing(sqlite3.connect(DATABASE)) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS feed_checkpoint (scope TEXT PRIMARY KEY, timestamp INTEGER)')
+        if value is not None:
+            db.execute('INSERT OR REPLACE INTO feed_checkpoint VALUES (?, ?)', (key, value))
+            db.commit()
+            return value
+        row = db.execute('SELECT timestamp FROM feed_checkpoint WHERE scope = ?', (key,)).fetchone()
+        return row[0] if row else None
+
+
 class MyCloud(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
@@ -61,6 +79,11 @@ class MyCloud(Gtk.Application):
         self.state = 'off'
         self.setup_busy = False
         self.quitting = False
+        self.force_scan = False
+        self.signin_window = None
+        self.feed_signin_required = False
+        self.feed_signin_prompted = False
+        self.feed_settings_message = None
         self.watcher = None
         self.changes = LocalChanges()
 
@@ -84,6 +107,7 @@ class MyCloud(Gtk.Application):
         self.pause_item = self.action(menu, 'Pause sync', self.toggle_sync)
         self.action(menu, 'Settings', self.show_settings)
         self.action(menu, 'Quit CaesarSync', self.quit_client)
+        self.scan_item = self.action(menu, 'Check all folders now', self.request_full_scan)
         menu.show_all()
         self.indicator.set_menu(menu)
         try:
@@ -136,6 +160,12 @@ class MyCloud(Gtk.Application):
         self.folder_item.set_sensitive(bool(self.settings))
         self.pause_item.set_sensitive(bool(self.settings.get('folders')))
         self.pause_item.set_label('Pause sync' if self.settings.get('enabled') else 'Resume sync')
+        self.scan_item.set_sensitive(bool(self.settings.get('enabled')))
+
+    def request_full_scan(self):
+        self.force_scan = True
+        self.next_scan = 0
+        self.tick()
 
     def load_last_transfer(self):
         transfer = None
@@ -201,15 +231,19 @@ class MyCloud(Gtk.Application):
             previous_status = (self.state, self.status, self.details)
             self.worker = threading.Thread(
                 target=self.sync,
-                args=(dict(self.settings), self.stop, full, self.changes, previous_status),
+                args=(dict(self.settings), self.stop, full, self.changes, previous_status, self.force_scan),
                 daemon=True,
             )
+            self.force_scan = False
             if full:
-                self.set_status('busy', 'Checking for changes')
+                if not self.settings.get('feed_enabled'):
+                    self.set_status('busy', 'Checking for changes')
             self.worker.start()
         return True
 
-    def sync(self, settings, stop, full, changes, previous_status):
+    def sync(self, settings, stop, full, changes, previous_status, force_scan):
+        delay = 300
+        sign_in_required = False
         try:
             credentials = account(settings)
             password = Secret.password_lookup_sync(SCHEMA, credentials, None)
@@ -227,12 +261,54 @@ class MyCloud(Gtk.Application):
 
             def scanning(folder):
                 if not stop.is_set():
-                    GLib.idle_add(self.show_transfer, stop, f'Checking {folder}', 'Checking for changes')
+                    phase = 'Initial reconciliation' if initializing else 'Checking for changes'
+                    GLib.idle_add(self.show_transfer, stop, f'Checking {folder}', phase)
 
-            waiting, errors = Sync(
+            engine = Sync(
                 dav, settings['root'], DATABASE, scope, report, stop.is_set,
                 transferred=transferred, scanning=scanning, take_changes=changes.take,
-            ).run(settings['folders'], full=full)
+            )
+            baseline = full
+            initializing = False
+            paths = ()
+            mark = None
+            feed_error = None
+            if full and settings.get('feed_enabled'):
+                delay = 15
+                baseline = force_scan
+                try:
+                    token = Secret.password_lookup_sync(FEED_SCHEMA, credentials, None)
+                    if not token:
+                        sign_in_required = True
+                        raise ValueError('Open Settings and sign in to Swisscom again.')
+                    since = checkpoint(settings)
+                    if since is None:
+                        delay = 300
+                    mark, paths = read_events(
+                        token, since if since is not None else int(time.time() * 1000) - 60_000,
+                    )
+                    baseline = force_scan or since is None
+                    initializing = since is None
+                    if initializing:
+                        scanning('selected folders for the initial reconciliation')
+                except HTTPError as exc:
+                    with exc:
+                        if exc.code in (401, 403):
+                            sign_in_required = True
+                            feed_error = 'Swisscom rejected the session. Sign in again in Settings.'
+                            delay = 300
+                        else:
+                            feed_error = f'Swisscom file-change check returned HTTP {exc.code}.'
+                except (ValueError, OSError) as exc:
+                    feed_error = str(exc)
+            if not Path(settings['root']).is_dir():
+                raise ValueError('The local sync folder is unavailable.')
+            waiting, errors = engine.run(settings['folders'], full=baseline, remote_paths=paths)
+            if mark is not None and not errors and not waiting and not stop.is_set():
+                checkpoint(settings, mark)
+                delay = 15
+            if feed_error:
+                errors.insert(0, feed_error)
             if errors:
                 status = ('error', 'Sync needs attention', '\n'.join(errors + waiting))
             elif waiting:
@@ -241,14 +317,14 @@ class MyCloud(Gtk.Application):
                 status = ('ok', 'Up to date', '') if full else previous_status
         except Exception as exc:
             status = ('error', 'Sync needs attention', str(exc))
-        GLib.idle_add(self.sync_finished, stop, status, full)
+        GLib.idle_add(self.sync_finished, stop, status, full, delay, sign_in_required)
 
     def show_transfer(self, stop, message, status='Syncing myCloud'):
         if not stop.is_set():
             self.set_status('busy', status, message)
         return False
 
-    def sync_finished(self, stop, status, full):
+    def sync_finished(self, stop, status, full, delay, sign_in_required=False):
         self.worker = None
         if self.quitting:
             self.quit()
@@ -257,8 +333,15 @@ class MyCloud(Gtk.Application):
         else:
             self.next_local = time.monotonic() + (8 if status[0] == 'error' else 0)
             if full:
-                self.next_scan = time.monotonic() + 8
+                self.next_scan = 0 if self.force_scan else time.monotonic() + delay
             self.set_status(*status)
+            if sign_in_required:
+                self.feed_signin_required = True
+                if self.feed_settings_message is not None:
+                    self.feed_settings_message.show()
+                if not self.feed_signin_prompted:
+                    self.feed_signin_prompted = True
+                    self.show_settings()
         return False
 
     def show_activity(self):
@@ -295,6 +378,7 @@ class MyCloud(Gtk.Application):
         window.set_default_size(590, 490)
         window.connect('destroy', lambda _: setattr(self, 'settings_window', None))
         self.settings_window = window
+        window.connect('destroy', lambda _: setattr(self, 'feed_settings_message', None))
         layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=18)
         window.add(layout)
         grid = Gtk.Grid(column_spacing=12, row_spacing=8)
@@ -330,6 +414,16 @@ class MyCloud(Gtk.Application):
         choose.connect('clicked', browse)
         test = Gtk.Button(label='Test connection and load folders')
         layout.pack_start(test, False, False, 0)
+        signin = Gtk.Button(label='Sign in to Swisscom for faster downloads')
+        signin.set_sensitive(bool(self.settings.get('username')))
+        layout.pack_start(signin, False, False, 0)
+        feed_notice = Gtk.Label(
+            label='Swisscom sign-in is needed again. Sign in to restore fast downloads.',
+            xalign=0, wrap=True, no_show_all=True,
+        )
+        layout.pack_start(feed_notice, False, False, 0)
+        self.feed_settings_message = feed_notice
+        feed_notice.set_visible(self.feed_signin_required)
         layout.pack_start(Gtk.Label(label='Folders to sync', xalign=0), False, False, 0)
         scroll = Gtk.ScrolledWindow(shadow_type=Gtk.ShadowType.IN)
         choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=8)
@@ -343,6 +437,48 @@ class MyCloud(Gtk.Application):
         layout.pack_start(start, False, False, 0)
         connected = {}
         checks = {}
+
+        def start_signin(_):
+            if self.signin_window is not None:
+                self.signin_window.present()
+                return
+            credentials = account(self.settings)
+
+            def store_token(token):
+                if credentials != account(self.settings):
+                    feedback.set_text('The configured WebDAV account changed. Sign in again.')
+                    return
+                try:
+                    if not Secret.password_store_sync(
+                        FEED_SCHEMA, credentials, Secret.COLLECTION_DEFAULT,
+                        'CaesarSync Swisscom sign-in', token, None,
+                    ):
+                        raise ValueError('Could not save the Swisscom session in the keyring.')
+                    settings = dict(self.settings, feed_enabled=True)
+                    save(settings)
+                except (OSError, ValueError, GLib.Error) as exc:
+                    feedback.set_text(str(exc))
+                    return
+                self.stop.set()
+                self.settings = settings
+                self.feed_signin_required = False
+                self.feed_signin_prompted = False
+                feed_notice.hide()
+                self.next_scan = 0
+                feedback.set_text('Swisscom sign-in complete. Incremental downloads are enabled.')
+                self.tick()
+
+            try:
+                from signin import SignIn
+                self.signin_window = SignIn(window, credentials['username'], store_token)
+            except (ImportError, ValueError) as exc:
+                feedback.set_text(f'Could not open Swisscom sign-in ({exc}).')
+                return
+            self.signin_window.connect('destroy', lambda _: setattr(self, 'signin_window', None))
+            self.signin_window.show_all()
+            self.signin_window.present()
+
+        signin.connect('clicked', start_signin)
 
         def values():
             return {key: field.get_text().strip() if key != 'password' else field.get_text()
@@ -435,12 +571,17 @@ class MyCloud(Gtk.Application):
                 ):
                     raise ValueError('Could not store the password in your Linux keyring.')
                 settings = dict(credentials, root=str(root), folders=folders, enabled=bool(folders))
+                if credentials == previous_account and self.settings.get('feed_enabled'):
+                    settings['feed_enabled'] = True
                 save(settings)
             except (OSError, ValueError, GLib.Error) as exc:
                 feedback.set_text(str(exc))
                 return
             self.stop.set()
             self.settings = settings
+            if credentials != previous_account:
+                self.feed_signin_required = False
+                self.feed_signin_prompted = False
             self.next_scan = 0
             self.refresh_menu()
             self.load_last_transfer()

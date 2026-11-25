@@ -10,14 +10,14 @@ from shutil import copy2
 import gi
 
 for namespace, version in (
-    ('Gtk', '3.0'), ('AyatanaAppIndicator3', '0.1'), ('Secret', '1'),
+    ('Gtk', '3.0'), ('AyatanaAppIndicator3', '0.1'), ('Secret', '1'), ('WebKit2', '4.1'),
 ):
     gi.require_version(namespace, version)
 
 data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
 app = data / 'caesarsync'
 (app / 'icons').mkdir(parents=True, exist_ok=True)
-for source in [Path('app.py'), Path('sync.py'), Path('watcher.py'), Path('launch'), *Path('icons').glob('cloud-*.svg')]:
+for source in [Path('app.py'), Path('sync.py'), Path('watcher.py'), Path('feed.py'), Path('signin.py'), Path('launch'), *Path('icons').glob('cloud-*.svg')]:
     copy2(source, app / source)
 
 def desktop_value(value):

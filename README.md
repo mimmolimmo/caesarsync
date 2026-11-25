@@ -1,12 +1,12 @@
 # CaesarSync
 
-**Experimental preview · v0.0.3**
+**Experimental preview · 1.0**
 
 CaesarSync is an independent Linux desktop sync client for **Swisscom myCloud**. It uses Swisscom's WebDAV file access. It is independently developed and is not affiliated with, endorsed by, or supported by Swisscom.
 
 Choose specific cloud folders, work with normal local copies, and check the latest upload, download, or removal from the tray. The tray distinguishes ongoing checks from the last completed transfer and shows the transfer size.
 
-CaesarSync watches selected local folders for saves and can upload them while a full scan is in progress. Incoming cloud changes are still checked by periodic WebDAV scans.
+CaesarSync watches selected local folders for saves and can upload them while a full scan is in progress. With Swisscom sign-in enabled, CaesarSync asks the desktop change feed for recently changed paths and verifies them through WebDAV. The saved checkpoint lets it request changes made while it was closed. The first connection reconciles all selected folders. **Check all folders now** in the tray triggers a manual reconciliation.
 
 ## Before you try it
 
@@ -20,7 +20,7 @@ CaesarSync watches selected local folders for saves and can upload them while a 
 Download and extract the bundle from [GitHub Releases](https://github.com/mimmolimmo/caesarsync/releases). The app requires Python 3.11+, GTK 3, a desktop with AppIndicator support, a Secret Service keyring, and `lsof`. On recent Ubuntu or Debian systems:
 
 ```sh
-sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-secret-1 lsof
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-secret-1 gir1.2-webkit2-4.1 lsof
 ```
 
 Run `./install.sh` from the extracted directory and open **CaesarSync** from your applications menu. To try it without installing, run `./launch` from that directory. Run `./launch --version` to print the version.
@@ -33,7 +33,11 @@ CaesarSync starts in the system tray and immediately uses its saved settings. Cl
 2. Click the CaesarSync tray icon and choose **Settings**. Enter the WebDAV address, username, and password, then connect.
 3. Choose a dedicated local folder and the cloud folders to sync. Click **Start sync**. Until then, the tray shows **Sync is off**.
 
+4. Reopen **Settings** and choose **Sign in to Swisscom for faster downloads**. Use the same myCloud account. The Swisscom session token is stored separately from the WebDAV password in the desktop keyring. If Swisscom rejects the saved session, CaesarSync opens Settings once and prompts you to sign in again. If you have yet to enable the feed, CaesarSync checks WebDAV periodically.
+
 CaesarSync uses HTTPS and stores the WebDAV password in your desktop keyring. Local copies are readable files. Use a trusted desktop and check the address against your myCloud settings before entering credentials.
+
+The desktop change feed is an experimental integration with Swisscom’s desktop service. It was tested with a live myCloud account for new files, deletions, and checkpoint reuse. Rename and catch-up scenarios are covered by local tests.
 
 ## Contribute
 

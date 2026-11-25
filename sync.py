@@ -194,7 +194,7 @@ class Sync:
         self.waiting = []
         self.errors = []
 
-    def run(self, folders, *, full=True):
+    def run(self, folders, *, full=True, remote_paths=()):
         if self.root.is_symlink():
             raise ValueError('The configured local sync folder became a symbolic link.')
         self.root.mkdir(parents=True, exist_ok=True)
@@ -206,6 +206,8 @@ class Sync:
                 scope TEXT PRIMARY KEY, path TEXT, size INTEGER, direction TEXT)''')
             self.selected = set(folders)
             self.sync_changes(db)
+            if remote_paths and not self.stopped():
+                self.sync_remote(db, remote_paths)
             if not full or self.stopped():
                 return self.waiting, self.errors
             available = self.dav.list()
@@ -221,6 +223,92 @@ class Sync:
                     self.errors.append(f'{folder}: {exc}')
             self.sync_changes(db)
         return self.waiting, self.errors
+
+    def sync_remote(self, db, paths):
+        listings = {}
+
+        def listing(folder):
+            if folder not in listings:
+                listings[folder] = self.dav.list(folder)
+            return listings[folder]
+
+        for relative in sorted(set(paths)):
+            if self.stopped():
+                return
+            parts = relative.split('/')
+            if parts[0] not in self.selected or any(p in {'', '.', '..'} for p in parts):
+                continue
+            try:
+                # Verify every missing ancestor against a successful parent listing.
+                parent = '/'.join(parts[:-1])
+                try:
+                    entries = listing(parent)
+                except HTTPError as error:
+                    if error.code != 404 or not parent:
+                        raise
+                    error.close()
+                    # A deleted directory may have events for descendants as well.
+                    for index in range(1, len(parts)):
+                        ancestor = '/'.join(parts[:index])
+                        entries = listing('/'.join(parts[:index - 1]))
+                        if parts[index - 1] not in entries:
+                            self.apply_remote_entry(db, ancestor, entries)
+                            break
+                    else:
+                        raise ValueError('Cloud parent changed while checking the update. Will retry.')
+                else:
+                    self.apply_remote_entry(db, relative, entries)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.errors.append(f'{relative}: {exc}')
+
+    def tracked(self, db, relative):
+        return db.execute(
+            'SELECT local, remote FROM files WHERE scope = ? AND path = ?',
+            (self.scope, relative),
+        ).fetchone()
+
+    def apply_remote_entry(self, db, relative, entries):
+        path = self.root / relative
+        if path.resolve() != path:
+            raise ValueError('A symbolic link occupies the local path.')
+        name = path.name
+        if name in entries and entries[name] is None:
+            if path.exists() and not path.is_dir():
+                raise ValueError('A local file has the same name as a cloud folder.')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.walk(db, relative, create_remote_folders=False)
+            return
+        if name in entries:
+            if path.is_dir():
+                raise ValueError('A local folder has the same name as a cloud file.')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.reconcile(db, relative, path, entries[name], self.tracked(db, relative))
+            return
+        if '/' not in relative:
+            raise ValueError('Selected cloud folder is no longer available.')
+        prefix = relative + '/'
+        if path.is_dir():
+            rows = db.execute(
+                'SELECT path, local, remote FROM files WHERE scope = ? AND substr(path, 1, ?) = ?',
+                (self.scope, len(prefix), prefix),
+            ).fetchall()
+            directories = {path}
+            for child, local_hash, cloud_version in rows:
+                if self.stopped():
+                    return
+                child_path = self.root / child
+                if child_path.resolve() != child_path:
+                    continue
+                directories.update(p for p in child_path.parents if p.is_relative_to(path))
+                try:
+                    self.reconcile(db, child, child_path, None, (local_hash, cloud_version))
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    self.errors.append(f'{child}: {exc}')
+            for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+                if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()):
+                    directory.rmdir()
+        else:
+            self.reconcile(db, relative, path, None, self.tracked(db, relative))
 
     def sync_changes(self, db):
         if self.take_changes is None or self.stopped():
@@ -262,7 +350,7 @@ class Sync:
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     self.errors.append(f'{relative}: {exc}')
 
-    def walk(self, db, relative):
+    def walk(self, db, relative, *, create_remote_folders=True):
         self.sync_changes(db)
         if self.stopped():
             return
@@ -298,10 +386,13 @@ class Sync:
                 if name in remote and cloud is None:
                     if local.get(name) is False:
                         raise ValueError('A local file has the same name as a cloud folder.')
-                    self.walk(db, child)
+                    self.walk(db, child, create_remote_folders=create_remote_folders)
                 elif local.get(name) is True:
                     if cloud is not None:
                         raise ValueError('A cloud file has the same name as a local folder.')
+                    if not create_remote_folders:
+                        self.apply_remote_entry(db, child, remote)
+                        continue
                     self.dav.mkdir(child)
                     self.walk(db, child)
                 else:
