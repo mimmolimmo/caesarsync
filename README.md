@@ -1,10 +1,12 @@
 # CaesarSync
 
-**Experimental preview · v0.0.1**
+**Experimental preview · v0.0.2**
 
 CaesarSync is an independent Linux desktop sync client for **Swisscom myCloud**. It uses Swisscom's WebDAV file access. It is independently developed and is not affiliated with, endorsed by, or supported by Swisscom.
 
-Choose specific cloud folders, work with normal local copies, and check the latest upload, download, or removal from the tray. Transfers show the file size.
+Choose specific cloud folders, work with normal local copies, and check the latest upload, download, or removal from the tray. The tray distinguishes ongoing checks from the last completed transfer and shows the transfer size.
+
+CaesarSync watches selected local folders for saves and can upload them while a full scan is in progress. Incoming cloud changes are still checked by periodic WebDAV scans.
 
 ## Before you try it
 
@@ -21,7 +23,7 @@ Download and extract the bundle from [GitHub Releases](https://github.com/mimmol
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-secret-1 lsof
 ```
 
-Run `./install.sh` from the extracted directory and open **CaesarSync** from your applications menu. To try it without installing, run `./launch` from that directory.
+Run `./install.sh` from the extracted directory and open **CaesarSync** from your applications menu. To try it without installing, run `./launch` from that directory. Run `./launch --version` to print the version.
 
 ## Configure
 

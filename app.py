@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 import threading
 import time
@@ -15,7 +16,9 @@ gi.require_version('Secret', '1')
 from gi.repository import AyatanaAppIndicator3 as Indicator, Gio, GLib, Gtk, Secret
 
 from sync import Sync, WebDAV, last_transfer
+from watcher import DirectoryWatcher, LocalChanges
 
+VERSION = '0.0.2'
 APP_ID = 'ch.caesarlinx.CaesarSync'
 DATA = Path(GLib.get_user_data_dir()) / 'caesarsync'
 CONFIG = DATA / 'settings.json'
@@ -52,11 +55,14 @@ class MyCloud(Gtk.Application):
         self.worker = None
         self.stop = threading.Event()
         self.next_scan = 0
+        self.next_local = 0
         self.status = 'Sync is off'
         self.details = ''
         self.state = 'off'
         self.setup_busy = False
         self.quitting = False
+        self.watcher = None
+        self.changes = LocalChanges()
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -88,7 +94,24 @@ class MyCloud(Gtk.Application):
             self.set_status('error', 'Could not read myCloud settings')
         self.refresh_menu()
         self.load_last_transfer()
+        self.configure_watcher()
         GLib.timeout_add_seconds(2, self.tick)
+        GLib.timeout_add(350, self.check_local_changes)
+
+    def configure_watcher(self):
+        if self.watcher is not None:
+            self.watcher.close()
+            self.watcher = None
+        self.changes = LocalChanges()
+        if self.settings.get('enabled'):
+            self.watcher = DirectoryWatcher(
+                self.settings['root'], self.settings['folders'], self.changes,
+            )
+
+    def check_local_changes(self):
+        if self.changes.ready():
+            self.tick()
+        return GLib.SOURCE_CONTINUE
 
     def do_activate(self):
         self.show_settings()
@@ -132,7 +155,7 @@ class MyCloud(Gtk.Application):
             action = {'Uploaded': 'Uploaded to myCloud',
                       'Downloaded': 'Downloaded locally'}.get(direction, direction)
             size_label = f' ({GLib.format_size(size)})' if size is not None else ''
-            self.transfer_item.set_label(f'{action}: {name}{size_label}')
+            self.transfer_item.set_label(f'Last completed · {action}: {name}{size_label}')
 
     def show_last_transfer(self, scope, path, size, direction):
         if scope == sync_scope(self.settings):
@@ -148,6 +171,7 @@ class MyCloud(Gtk.Application):
         self.settings['enabled'] = not self.settings['enabled']
         save(self.settings)
         self.refresh_menu()
+        self.configure_watcher()
         if self.settings['enabled']:
             self.next_scan = 0
             self.set_status('busy', 'Waiting to sync')
@@ -159,22 +183,31 @@ class MyCloud(Gtk.Application):
     def quit_client(self):
         self.quitting = True
         self.stop.set()
+        if self.watcher is not None:
+            self.watcher.close()
         if self.worker is None:
             self.quit()
         else:
             self.set_status('off', 'Finishing the current transfer before quitting')
 
     def tick(self):
+        now = time.monotonic()
+        full = now >= self.next_scan
         if (not self.quitting and self.settings.get('enabled') and self.worker is None
-                and time.monotonic() >= self.next_scan):
+                and (full or (now >= self.next_local and self.changes.ready()))):
             self.stop = threading.Event()
+            previous_status = (self.state, self.status, self.details)
             self.worker = threading.Thread(
-                target=self.sync, args=(dict(self.settings), self.stop), daemon=True,
+                target=self.sync,
+                args=(dict(self.settings), self.stop, full, self.changes, previous_status),
+                daemon=True,
             )
+            if full:
+                self.set_status('busy', 'Checking for changes')
             self.worker.start()
         return True
 
-    def sync(self, settings, stop):
+    def sync(self, settings, stop, full, changes, previous_status):
         try:
             credentials = account(settings)
             password = Secret.password_lookup_sync(SCHEMA, credentials, None)
@@ -190,33 +223,39 @@ class MyCloud(Gtk.Application):
             def transferred(path, size, direction):
                 GLib.idle_add(self.show_last_transfer, scope, path, size, direction)
 
+            def scanning(folder):
+                if not stop.is_set():
+                    GLib.idle_add(self.show_transfer, stop, f'Checking {folder}', 'Checking for changes')
+
             waiting, errors = Sync(
                 dav, settings['root'], DATABASE, scope, report, stop.is_set,
-                transferred=transferred,
-            ).run(settings['folders'])
+                transferred=transferred, scanning=scanning, take_changes=changes.take,
+            ).run(settings['folders'], full=full)
             if errors:
                 status = ('error', 'Sync needs attention', '\n'.join(errors + waiting))
             elif waiting:
                 status = ('wait', 'Incoming updates waiting', '\n'.join(waiting))
             else:
-                status = ('ok', 'Up to date', '')
+                status = ('ok', 'Up to date', '') if full else previous_status
         except Exception as exc:
             status = ('error', 'Sync needs attention', str(exc))
-        GLib.idle_add(self.sync_finished, stop, status)
+        GLib.idle_add(self.sync_finished, stop, status, full)
 
-    def show_transfer(self, stop, message):
+    def show_transfer(self, stop, message, status='Syncing myCloud'):
         if not stop.is_set():
-            self.set_status('busy', 'Syncing myCloud', message)
+            self.set_status('busy', status, message)
         return False
 
-    def sync_finished(self, stop, status):
+    def sync_finished(self, stop, status, full):
         self.worker = None
         if self.quitting:
             self.quit()
         elif stop.is_set():
             self.next_scan = 0
         else:
-            self.next_scan = time.monotonic() + 8
+            self.next_local = time.monotonic() + (8 if status[0] == 'error' else 0)
+            if full:
+                self.next_scan = time.monotonic() + 8
             self.set_status(*status)
         return False
 
@@ -250,7 +289,7 @@ class MyCloud(Gtk.Application):
         if self.settings_window is not None:
             self.settings_window.present()
             return
-        window = Gtk.ApplicationWindow(application=self, title='CaesarSync Settings')
+        window = Gtk.ApplicationWindow(application=self, title=f'CaesarSync {VERSION} Settings')
         window.set_default_size(590, 490)
         window.connect('destroy', lambda _: setattr(self, 'settings_window', None))
         self.settings_window = window
@@ -403,6 +442,7 @@ class MyCloud(Gtk.Application):
             self.next_scan = 0
             self.refresh_menu()
             self.load_last_transfer()
+            self.configure_watcher()
             self.set_status('busy', 'Waiting to sync') if folders else self.set_status('off', 'Sync is off')
             window.destroy()
             self.tick()
@@ -414,4 +454,7 @@ class MyCloud(Gtk.Application):
 
 
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--version']:
+        print(f'CaesarSync {VERSION}')
+        raise SystemExit(0)
     raise SystemExit(MyCloud().run())

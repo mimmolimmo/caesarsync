@@ -185,6 +185,42 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(self.cloud['Selected/Café notes.txt'], b'Mac edit')
             self.assertEqual(self.path.read_bytes(), b'Linux save')
 
+    def test_local_save_checks_only_its_parent(self):
+        self.scan()
+        relative = 'Selected/Café notes.txt'
+        self.path.write_bytes(b'local save')
+        listed = []
+        list_directory = self.dav.list
+
+        def track(folder=''):
+            listed.append(folder)
+            return list_directory(folder)
+
+        self.dav.list = track
+        queued = [relative, 'Other/skip.txt']
+        sync = Sync(self.dav, self.root, self.db, 'test', lambda _: None, lambda: False,
+                    take_changes=lambda: queued)
+        self.assertEqual(sync.run(['Selected'], full=False), ([], []))
+        self.assertEqual(set(listed), {'Selected'})
+        self.assertEqual(self.cloud[relative], b'local save')
+
+    def test_upload_tracks_listing_tag_when_put_returns_a_different_tag(self):
+        self.scan()
+        relative = 'Selected/Café notes.txt'
+        self.path.write_bytes(b'local save')
+        upload = self.dav.upload
+
+        def different_tag(*args):
+            upload(*args)
+            return '"upload-response-etag"'
+
+        self.dav.upload = different_tag
+        self.scan()
+        self.path.unlink()
+        self.scan()
+        self.assertNotIn(relative, self.cloud)
+        self.assertFalse(self.path.exists())
+
     def test_upload_rejects_cloud_edit_after_listing(self):
         self.scan()
         relative = 'Selected/Café notes.txt'

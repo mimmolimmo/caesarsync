@@ -1,5 +1,6 @@
 """WebDAV transport and selective file reconciliation."""
 import base64
+from contextlib import closing
 import hashlib
 import mimetypes
 import os
@@ -178,7 +179,8 @@ def last_transfer(database, scope):
 
 
 class Sync:
-    def __init__(self, dav, root, database, scope, report, stopped, is_open=open_on_disk, *, transferred=None):
+    def __init__(self, dav, root, database, scope, report, stopped, is_open=open_on_disk,
+                 *, transferred=None, scanning=None, take_changes=None):
         self.dav = dav
         self.root = Path(root)
         self.database = database
@@ -187,19 +189,25 @@ class Sync:
         self.stopped = stopped
         self.is_open = is_open
         self.transferred = transferred
+        self.scanning = scanning
+        self.take_changes = take_changes
         self.waiting = []
         self.errors = []
 
-    def run(self, folders):
+    def run(self, folders, *, full=True):
         if self.root.is_symlink():
             raise ValueError('The configured local sync folder became a symbolic link.')
         self.root.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db:
             db.execute('''CREATE TABLE IF NOT EXISTS files (
                 scope TEXT, path TEXT, local TEXT, remote TEXT,
                 PRIMARY KEY(scope, path))''')
             db.execute('''CREATE TABLE IF NOT EXISTS transfers (
                 scope TEXT PRIMARY KEY, path TEXT, size INTEGER, direction TEXT)''')
+            self.selected = set(folders)
+            self.sync_changes(db)
+            if not full or self.stopped():
+                return self.waiting, self.errors
             available = self.dav.list()
             for folder in folders:
                 if self.stopped():
@@ -211,9 +219,55 @@ class Sync:
                     self.walk(db, folder)
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     self.errors.append(f'{folder}: {exc}')
+            self.sync_changes(db)
         return self.waiting, self.errors
 
+    def sync_changes(self, db):
+        if self.take_changes is None or self.stopped():
+            return
+        by_parent = {}
+        for relative in self.take_changes():
+            parts = Path(relative).parts
+            if len(parts) < 2 or parts[0] not in self.selected or '..' in parts:
+                continue
+            parent, name = relative.rsplit('/', 1)
+            by_parent.setdefault(parent, []).append(name)
+        for parent, names in by_parent.items():
+            folder = self.root / parent
+            if not folder.is_dir() or folder.resolve() != folder:
+                continue
+            remote = None
+            for name in names:
+                if self.stopped():
+                    return
+                relative = parent + '/' + name
+                path = folder / name
+                try:
+                    if path.is_symlink() or (path.exists() and not path.is_file()):
+                        continue
+                    previous = db.execute(
+                        'SELECT local, remote FROM files WHERE scope = ? AND path = ?',
+                        (self.scope, relative),
+                    ).fetchone()
+                    if fingerprint(path) == (previous[0] if previous else None):
+                        continue
+                    if remote is None:
+                        remote = self.dav.list(parent)
+                    if name in remote and remote[name] is None:
+                        raise ValueError('A cloud folder has the same name as the local file.')
+                    self.reconcile(db, relative, path, remote.get(name), previous)
+                except HTTPError as exc:
+                    self.errors.append(f'{relative}: {exc}')
+                    exc.close()
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    self.errors.append(f'{relative}: {exc}')
+
     def walk(self, db, relative):
+        self.sync_changes(db)
+        if self.stopped():
+            return
+        if self.scanning is not None:
+            self.scanning(relative)
         folder = self.root / relative
         if folder.is_symlink():
             raise ValueError('A symbolic link occupies the local folder.')
@@ -329,15 +383,14 @@ class Sync:
                         exc.close()
                         raise ValueError('Cloud copy changed before upload. Local copy kept.') from exc
                     raise
-            if not tag:
-                cloud_file = self.dav.list(relative.rsplit('/', 1)[0]).get(path.name)
-                if cloud_file is None:
-                    raise ValueError('Upload could not be confirmed. Will retry.')
+            cloud_file = self.dav.list(relative.rsplit('/', 1)[0]).get(path.name)
+            if cloud_file is None:
+                raise ValueError('Upload could not be confirmed. Will retry.')
+            if tag != cloud_file.version:
                 with self.dav.download(relative, cloud_file) as stream:
                     if hashlib.file_digest(stream, 'sha256').hexdigest() != uploaded_hash:
                         raise ValueError('The cloud file changed immediately after upload. Will retry.')
-                tag = cloud_file.version
-            self.remember(db, relative, uploaded_hash, tag, transfer=(size, 'Uploaded'))
+            self.remember(db, relative, uploaded_hash, cloud_file.version, transfer=(size, 'Uploaded'))
         elif version != old_remote:
             if local is not None and self.is_open(path):
                 self.waiting.append(relative)
